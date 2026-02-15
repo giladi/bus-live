@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>קו {{ line }} — יציאות קרובות</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 24px; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
+    .title { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+    .muted { color: #666; font-size: 13px; }
+    ul { margin: 10px 0 0; padding: 0 18px; }
+    li { margin: 6px 0; }
+    .pill { display: inline-block; padding: 2px 8px; border: 1px solid #ddd; border-radius: 999px; font-size: 12px; color: #333; margin-inline-start: 8px; }
+  </style>
+</head>
+<body>
+  <h1>קו {{ line }} — יציאות קרובות</h1>
+  <p class="muted">תחנות: {{ stops | join(", ") }} · רענון אוטומטי כל 20 שניות</p>
+
+  <div id="status" class="muted"></div>
+  <div id="cards" class="grid"></div>
+
+  <script>
+    async function refresh() {
+      const status = document.getElementById("status");
+      const cards = document.getElementById("cards");
+      status.textContent = "טוען…";
+
+      try {
+        const res = await fetch("/api/departures");
+        const data = await res.json();
+
+        cards.innerHTML = "";
+        (data.results || []).forEach(r => {
+          const el = document.createElement("div");
+          el.className = "card";
+
+          const header = `
+            <div class="title">${r.stop_name || "תחנה"} <span class="pill">#${r.stop_code}</span></div>
+            <div class="muted">עודכן: ${r.updated_at}</div>
+          `;
+
+          let list = "";
+          if (!r.departures || r.departures.length === 0) {
+            list = "<p>לא נמצאו יציאות קרובות לקו 63 כרגע.</p>";
+          } else {
+            const items = r.departures.map(d =>
+              `<li>${d.time_hhmm} (בעוד ~${d.in_minutes} דק׳) ${d.is_realtime ? '<span class="pill">Realtime</span>' : ''}</li>`
+            ).join("");
+            list = `<ul>${items}</ul>`;
+          }
+
+          el.innerHTML = header + list;
+          cards.appendChild(el);
+        });
+
+        if (data.errors && data.errors.length) {
+          status.textContent = "חלק מהתחנות נכשלו: " + data.errors.map(e => `${e.stop_code}: ${e.error}`).join(" | ");
+        } else {
+          status.textContent = "";
+        }
+      } catch (e) {
+        status.textContent = "שגיאה בטעינה: " + e;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 20000);
+  </script>
+</body>
+</html>
+

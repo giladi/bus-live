@@ -48,6 +48,12 @@
   <script>
     const LINE = "{{ line }}";
 
+    // עוזר להציג הודעות שגיאה קצרות
+    function shortText(x, maxLen = 160) {
+      const s = String(x ?? "");
+      return s.length > maxLen ? s.slice(0, maxLen) + "…" : s;
+    }
+
     // ===== חלק 1: יציאות מהתחנות =====
     async function refreshDepartures() {
       const status = document.getElementById("status");
@@ -56,6 +62,13 @@
 
       try {
         const res = await fetch("/api/departures", { cache: "no-store" });
+
+        if (!res.ok) {
+          const txt = await res.text();
+          status.textContent = `שגיאה מהשרת (${res.status}): ${shortText(txt)}`;
+          return;
+        }
+
         const data = await res.json();
 
         cards.innerHTML = "";
@@ -88,7 +101,7 @@
           status.textContent = "";
         }
       } catch (e) {
-        status.textContent = "שגיאה בטעינת יציאות: " + e;
+        status.textContent = "שגיאה בטעינת יציאות: " + shortText(e);
       }
     }
 
@@ -111,7 +124,18 @@
 
       try {
         const res = await fetch(`/api/vehicles?line=${encodeURIComponent(LINE)}`, { cache: "no-store" });
+
+        if (!res.ok) {
+          const txt = await res.text();
+          mapStatus.textContent = `שגיאה מהשרת (${res.status}): ${shortText(txt)}`;
+          return;
+        }
+
         const json = await res.json();
+
+        // אם השרת החזיר errors (מה-main.py), נציג למשתמש
+        const apiErrors = (json.errors || []);
+        const candidatesTried = json.candidates_tried || json.candidates || [];
 
         const vehicles = json.vehicles || [];
         const seen = new Set();
@@ -120,12 +144,21 @@
         for (const v of vehicles) {
           const key = v.vehicle_ref || `${v.lat},${v.lon}`;
           seen.add(key);
+
           const latlng = [v.lat, v.lon];
           latlngs.push(latlng);
 
           if (!markers.has(key)) {
             const m = L.marker(latlng).addTo(map);
-            m.bindPopup(`קו ${LINE}<br>${v.recorded_at_time || ""}`);
+
+            const popup = [
+              `קו ${LINE}`,
+              v.recorded_at_time ? `דיווח: ${v.recorded_at_time}` : "",
+              v.agency_name ? `מפעיל: ${v.agency_name}` : "",
+              v.route_long_name ? `מסלול: ${v.route_long_name}` : "",
+            ].filter(Boolean).join("<br>");
+
+            m.bindPopup(popup);
             markers.set(key, m);
           } else {
             markers.get(key).setLatLng(latlng);
@@ -141,7 +174,14 @@
         }
 
         if (vehicles.length === 0) {
-          mapStatus.textContent = `לא נמצאו מיקומים חיים לקו ${LINE} כרגע.`;
+          // אם יש שגיאות API, נציג אותן כדי שתדע אם זה Timeout או משהו אחר
+          if (apiErrors.length) {
+            mapStatus.textContent = `אין מיקומים כרגע (ייתכן ש-Stride איטי): ${shortText(apiErrors.join(" | "))}`;
+          } else if (candidatesTried.length === 0) {
+            mapStatus.textContent = `לא נמצאו התאמות לקו ${LINE} בנתוני GTFS (candidates ריק).`;
+          } else {
+            mapStatus.textContent = `לא נמצאו מיקומים חיים לקו ${LINE} כרגע.`;
+          }
         } else {
           mapStatus.textContent = `נמצאו ${vehicles.length} אוטובוסים (עודכן עכשיו).`;
 
@@ -153,7 +193,7 @@
           }
         }
       } catch (e) {
-        mapStatus.textContent = "שגיאה בטעינת מיקומים: " + e;
+        mapStatus.textContent = "שגיאה בטעינת מיקומים: " + shortText(e);
       }
     }
 

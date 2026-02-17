@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from functools import lru_cache
 from zoneinfo import ZoneInfo
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Any
 
 import httpx
@@ -49,7 +49,6 @@ def resolve_stop_id(stop_code: str) -> dict:
     if not data:
         raise ValueError(f"Station not found for code {stop_code}")
 
-    # בד"כ האיבר הראשון הוא ההתאמה הנכונה. אם תרצה אפשר להקשיח בהמשך.
     first = data[0]
     return {
         "stop_code": stop_code,
@@ -89,7 +88,6 @@ def fetch_line_departures(stop_code: str, line: str) -> dict:
             continue
 
         service_day = int(t0.get("serviceDay", 0))
-        # realtimeArrival אם יש; אם לא, ניפול ל-scheduledArrival
         sec_into_day = t0.get("realtimeArrival", None)
         if sec_into_day is None:
             sec_into_day = t0.get("scheduledArrival", None)
@@ -122,6 +120,45 @@ def fetch_line_departures(stop_code: str, line: str) -> dict:
     }
 
 
+@lru_cache(maxsize=64)
+def stride_resolve_line_refs(route_short_name: str) -> list[dict[str, str]]:
+    """
+    ממיר מספר קו ציבורי (כמו 63) ל-line_ref/operator_ref של Stride
+    באמצעות gtfs_routes/list.
+    """
+    params = {
+        "route_short_name": _normalize_line(route_short_name),
+        "limit": 200,
+        # מצמצם רעש ליום הנוכחי (אפשר להסיר אם צריך)
+        "date_from": date.today().isoformat(),
+        "date_to": date.today().isoformat(),
+    }
+
+    with httpx.Client(timeout=15, headers={"User-Agent": HEADERS["User-Agent"]}) as client:
+        r = client.get(f"{STRIDE_BASE}/gtfs_routes/list", params=params)
+        r.raise_for_status()
+        routes = r.json() or []
+
+    pairs: dict[tuple[str, str], dict[str, str]] = {}
+    for rt in routes:
+        line_ref = rt.get("line_ref")
+        operator_ref = rt.get("operator_ref")
+        if line_ref is None or operator_ref is None:
+            continue
+
+        key = (str(line_ref), str(operator_ref))
+        if key not in pairs:
+            pairs[key] = {
+                "line_ref": str(line_ref),
+                "operator_ref": str(operator_ref),
+                "agency_name": str(rt.get("agency_name") or ""),
+                "route_long_name": str(rt.get("route_long_name") or ""),
+                "direction": str(rt.get("route_direction") or ""),
+            }
+
+    return list(pairs.values())
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     return templates.TemplateResponse(
@@ -146,49 +183,77 @@ def api_departures():
 @app.get("/api/vehicles")
 def api_vehicles(line: str = LINE):
     """
-    מחזיר מיקומי אוטובוסים בזמן אמת לפי מספר קו.
-    מבוסס על Open Bus Stride siri_vehicle_locations.
+    מחזיר מיקומי אוטובוסים בזמן אמת לפי מספר קו ציבורי (כמו 63),
+    ע"י המרה ל-line_ref/operator_ref ואז שאילתא ל-siri_vehicle_locations.
     """
-    now = datetime.now(TZ)  # Israel time (handles DST)
-    since = now - timedelta(minutes=7)
+    now = datetime.now(TZ)
+    since = now - timedelta(minutes=10)  # קצת יותר רחב, עוזר למצוא מיקומים
 
-    params = {
-        "siri_routes__line_ref": _normalize_line(line),
-        "recorded_at_time_from": since.isoformat(),
-        "limit": 200,
-    }
+    candidates = stride_resolve_line_refs(line)
 
-    # חשוב: ה-API הזה לפעמים מחזיר שדות בשמות שונים בין גרסאות/מקורות,
-    # אז אנחנו מנסים כמה אפשרויות (lat/lon או vehicle_location).
-    with httpx.Client(headers={"User-Agent": HEADERS["User-Agent"]}, timeout=10) as client:
-        r = client.get(f"{STRIDE_BASE}/siri_vehicle_locations/list", params=params)
-        r.raise_for_status()
-        data: list[dict[str, Any]] = r.json()
+    vehicles: list[dict[str, Any]] = []
 
-    vehicles = []
-    for item in data or []:
-        lat = item.get("lat")
-        lon = item.get("lon")
-
-        nested = item.get("siri_vehicle_location") or item.get("vehicle_location") or {}
-        if lat is None:
-            lat = nested.get("lat")
-        if lon is None:
-            lon = nested.get("lon")
-
-        if lat is None or lon is None:
-            continue
-
-        vehicles.append(
-            {
-                "lat": float(lat),
-                "lon": float(lon),
-                "recorded_at_time": item.get("recorded_at_time") or nested.get("recorded_at_time"),
-                "vehicle_ref": item.get("siri_ride_vehicle_ref")
-                or item.get("vehicle_ref")
-                or item.get("vehicle_id")
-                or None,
+    with httpx.Client(timeout=15, headers={"User-Agent": HEADERS["User-Agent"]}) as client:
+        for c in candidates:
+            params = {
+                "recorded_at_time_from": since.isoformat(),
+                "limit": 300,
+                "siri_routes__line_ref": c["line_ref"],
+                "siri_routes__operator_ref": c["operator_ref"],
+                "order_by": "recorded_at_time desc",
             }
-        )
 
-    return JSONResponse({"line": _normalize_line(line), "vehicles": vehicles})
+            r = client.get(f"{STRIDE_BASE}/siri_vehicle_locations/list", params=params)
+            r.raise_for_status()
+            data: list[dict[str, Any]] = r.json() or []
+
+            for item in data:
+                lat = item.get("lat")
+                lon = item.get("lon")
+
+                nested = item.get("siri_vehicle_location") or item.get("vehicle_location") or {}
+                if lat is None:
+                    lat = nested.get("lat")
+                if lon is None:
+                    lon = nested.get("lon")
+
+                if lat is None or lon is None:
+                    continue
+
+                vehicles.append(
+                    {
+                        "lat": float(lat),
+                        "lon": float(lon),
+                        "recorded_at_time": item.get("recorded_at_time") or nested.get("recorded_at_time"),
+                        "vehicle_ref": item.get("siri_ride__vehicle_ref")
+                        or item.get("siri_ride_vehicle_ref")
+                        or item.get("vehicle_ref")
+                        or item.get("vehicle_id")
+                        or None,
+                        # metadata לדיבוג/הבנה
+                        "stride_line_ref": c["line_ref"],
+                        "stride_operator_ref": c["operator_ref"],
+                        "agency_name": c.get("agency_name", ""),
+                        "route_long_name": c.get("route_long_name", ""),
+                        "direction": c.get("direction", ""),
+                    }
+                )
+
+    # דה-דופ בסיסי
+    seen = set()
+    uniq = []
+    for v in vehicles:
+        key = (v.get("vehicle_ref"), v["lat"], v["lon"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(v)
+
+    return JSONResponse(
+        {
+            "line": _normalize_line(line),
+            "since": since.isoformat(),
+            "candidates": candidates,
+            "vehicles": uniq,
+        }
+    )

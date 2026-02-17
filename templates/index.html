@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>קו {{ line }} — יציאות קרובות</title>
+
   <style>
     body { font-family: system-ui, Arial; margin: 24px; }
     .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
@@ -13,23 +14,48 @@
     ul { margin: 10px 0 0; padding: 0 18px; }
     li { margin: 6px 0; }
     .pill { display: inline-block; padding: 2px 8px; border: 1px solid #ddd; border-radius: 999px; font-size: 12px; color: #333; margin-inline-start: 8px; }
+
+    .section { margin-top: 18px; }
+    #map { height: 420px; border-radius: 12px; border: 1px solid #ddd; overflow: hidden; }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap: wrap; }
   </style>
+
+  <!-- Leaflet (מפה) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 </head>
+
 <body>
   <h1>קו {{ line }} — יציאות קרובות</h1>
   <p class="muted">תחנות: {{ stops | join(", ") }} · רענון אוטומטי כל 20 שניות</p>
 
-  <div id="status" class="muted"></div>
-  <div id="cards" class="grid"></div>
+  <!-- מפה -->
+  <div class="section">
+    <div class="row">
+      <h2 style="margin:0;">מיקום אוטובוסים על המפה</h2>
+      <div id="mapStatus" class="muted"></div>
+    </div>
+    <div id="map"></div>
+  </div>
+
+  <!-- יציאות -->
+  <div class="section">
+    <div id="status" class="muted"></div>
+    <div id="cards" class="grid"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
   <script>
-    async function refresh() {
+    const LINE = "{{ line }}";
+
+    // ===== חלק 1: יציאות מהתחנות =====
+    async function refreshDepartures() {
       const status = document.getElementById("status");
       const cards = document.getElementById("cards");
-      status.textContent = "טוען…";
+      status.textContent = "טוען יציאות…";
 
       try {
-        const res = await fetch("/api/departures");
+        const res = await fetch("/api/departures", { cache: "no-store" });
         const data = await res.json();
 
         cards.innerHTML = "";
@@ -44,7 +70,7 @@
 
           let list = "";
           if (!r.departures || r.departures.length === 0) {
-            list = "<p>לא נמצאו יציאות קרובות לקו 63 כרגע.</p>";
+            list = `<p>לא נמצאו יציאות קרובות לקו ${LINE} כרגע.</p>`;
           } else {
             const items = r.departures.map(d =>
               `<li>${d.time_hhmm} (בעוד ~${d.in_minutes} דק׳) ${d.is_realtime ? '<span class="pill">Realtime</span>' : ''}</li>`
@@ -62,13 +88,81 @@
           status.textContent = "";
         }
       } catch (e) {
-        status.textContent = "שגיאה בטעינה: " + e;
+        status.textContent = "שגיאה בטעינת יציאות: " + e;
       }
     }
 
-    refresh();
-    setInterval(refresh, 20000);
+    // ===== חלק 2: מפה + מיקומי אוטובוסים =====
+    const mapStatus = document.getElementById("mapStatus");
+
+    // מרכז ברירת מחדל (ישראל). ננסה לעשות fit אוטומטי אם יש אוטובוסים.
+    const map = L.map("map").setView([32.0853, 34.7818], 11);
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap",
+    }).addTo(map);
+
+    const markers = new Map(); // key -> marker
+    let didFitOnce = false;
+
+    async function refreshVehicles() {
+      mapStatus.textContent = "טוען מיקום אוטובוסים…";
+
+      try {
+        const res = await fetch(`/api/vehicles?line=${encodeURIComponent(LINE)}`, { cache: "no-store" });
+        const json = await res.json();
+
+        const vehicles = json.vehicles || [];
+        const seen = new Set();
+        const latlngs = [];
+
+        for (const v of vehicles) {
+          const key = v.vehicle_ref || `${v.lat},${v.lon}`;
+          seen.add(key);
+          const latlng = [v.lat, v.lon];
+          latlngs.push(latlng);
+
+          if (!markers.has(key)) {
+            const m = L.marker(latlng).addTo(map);
+            m.bindPopup(`קו ${LINE}<br>${v.recorded_at_time || ""}`);
+            markers.set(key, m);
+          } else {
+            markers.get(key).setLatLng(latlng);
+          }
+        }
+
+        // להסיר מרקרים שלא קיימים יותר
+        for (const [key, marker] of markers.entries()) {
+          if (!seen.has(key)) {
+            map.removeLayer(marker);
+            markers.delete(key);
+          }
+        }
+
+        if (vehicles.length === 0) {
+          mapStatus.textContent = `לא נמצאו מיקומים חיים לקו ${LINE} כרגע.`;
+        } else {
+          mapStatus.textContent = `נמצאו ${vehicles.length} אוטובוסים (עודכן עכשיו).`;
+
+          // רק פעם אחת לעשות zoom מתאים, כדי לא “להקפיץ” את המשתמש כל הזמן
+          if (!didFitOnce && latlngs.length >= 1) {
+            didFitOnce = true;
+            const bounds = L.latLngBounds(latlngs);
+            map.fitBounds(bounds, { padding: [30, 30] });
+          }
+        }
+      } catch (e) {
+        mapStatus.textContent = "שגיאה בטעינת מיקומים: " + e;
+      }
+    }
+
+    // init
+    refreshDepartures();
+    refreshVehicles();
+
+    setInterval(refreshDepartures, 20000);
+    setInterval(refreshVehicles, 15000);
   </script>
 </body>
 </html>
-

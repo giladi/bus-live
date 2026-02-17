@@ -183,29 +183,60 @@ def api_departures():
 @app.get("/api/vehicles")
 def api_vehicles(line: str = LINE):
     """
-    מחזיר מיקומי אוטובוסים בזמן אמת לפי מספר קו ציבורי (כמו 63),
-    ע"י המרה ל-line_ref/operator_ref ואז שאילתא ל-siri_vehicle_locations.
+    מחזיר מיקומי אוטובוסים בזמן אמת לפי מספר קו ציבורי (כמו 63).
+    תמיד מחזיר JSON (גם אם Stride איטי/נופל) כדי שה-frontend לא יקרוס.
     """
     now = datetime.now(TZ)
-    since = now - timedelta(minutes=10)  # קצת יותר רחב, עוזר למצוא מיקומים
+    since = now - timedelta(minutes=10)
 
     candidates = stride_resolve_line_refs(line)
 
-    vehicles: list[dict[str, Any]] = []
+    if not candidates:
+        return JSONResponse(
+            {
+                "line": _normalize_line(line),
+                "since": since.isoformat(),
+                "candidates_tried": [],
+                "vehicles": [],
+                "errors": ["No GTFS routes found for this line (route_short_name)."],
+            },
+            status_code=200,
+        )
 
-    with httpx.Client(timeout=15, headers={"User-Agent": HEADERS["User-Agent"]}) as client:
-        for c in candidates:
+    # Timeout אגרסיבי כדי לא להיתקע (זה פותר ReadTimeout ב-Render)
+    timeout = httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=5.0)
+
+    vehicles: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    # לא לנסות על יותר מדי אפשרויות (עוזר גם ל-timeout)
+    max_candidates = 6
+    candidates_to_try = candidates[:max_candidates]
+
+    with httpx.Client(timeout=timeout, headers={"User-Agent": HEADERS["User-Agent"]}) as client:
+        for c in candidates_to_try:
             params = {
                 "recorded_at_time_from": since.isoformat(),
-                "limit": 300,
+                "limit": 200,
                 "siri_routes__line_ref": c["line_ref"],
                 "siri_routes__operator_ref": c["operator_ref"],
                 "order_by": "recorded_at_time desc",
             }
 
-            r = client.get(f"{STRIDE_BASE}/siri_vehicle_locations/list", params=params)
-            r.raise_for_status()
-            data: list[dict[str, Any]] = r.json() or []
+            try:
+                r = client.get(f"{STRIDE_BASE}/siri_vehicle_locations/list", params=params)
+                r.raise_for_status()
+                data: list[dict[str, Any]] = r.json() or []
+            except httpx.TimeoutException:
+                errors.append(
+                    f"Timeout fetching vehicles for line_ref={c['line_ref']} operator_ref={c['operator_ref']}"
+                )
+                continue
+            except Exception as e:
+                errors.append(
+                    f"Error fetching vehicles for line_ref={c['line_ref']} operator_ref={c['operator_ref']}: {e}"
+                )
+                continue
 
             for item in data:
                 lat = item.get("lat")
@@ -230,7 +261,6 @@ def api_vehicles(line: str = LINE):
                         or item.get("vehicle_ref")
                         or item.get("vehicle_id")
                         or None,
-                        # metadata לדיבוג/הבנה
                         "stride_line_ref": c["line_ref"],
                         "stride_operator_ref": c["operator_ref"],
                         "agency_name": c.get("agency_name", ""),
@@ -238,6 +268,10 @@ def api_vehicles(line: str = LINE):
                         "direction": c.get("direction", ""),
                     }
                 )
+
+            # אם מצאנו משהו — לא צריך להמשיך ולבזבז זמן
+            if vehicles:
+                break
 
     # דה-דופ בסיסי
     seen = set()
@@ -253,7 +287,9 @@ def api_vehicles(line: str = LINE):
         {
             "line": _normalize_line(line),
             "since": since.isoformat(),
-            "candidates": candidates,
+            "candidates_tried": candidates_to_try,
             "vehicles": uniq,
-        }
+            "errors": errors,
+        },
+        status_code=200,
     )

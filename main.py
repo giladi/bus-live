@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime
-from zoneinfo import ZoneInfo
 from functools import lru_cache
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
@@ -25,6 +26,7 @@ HEADERS = {
 
 STOP_SEARCH_URL = "https://app.busnearby.co.il/stopSearch"
 STOPTIMES_URL_TMPL = "https://api.busnearby.co.il/directions/index/stops/1:{stop_id}/stoptimes"
+STRIDE_BASE = "https://open-bus-stride-api.hasadna.org.il"
 
 STOPS = ["20727", "26206"]
 LINE = "63"
@@ -140,3 +142,53 @@ def api_departures():
 
     return JSONResponse({"line": LINE, "results": results, "errors": errors})
 
+
+@app.get("/api/vehicles")
+def api_vehicles(line: str = LINE):
+    """
+    מחזיר מיקומי אוטובוסים בזמן אמת לפי מספר קו.
+    מבוסס על Open Bus Stride siri_vehicle_locations.
+    """
+    now = datetime.now(TZ)  # Israel time (handles DST)
+    since = now - timedelta(minutes=7)
+
+    params = {
+        "siri_routes__line_ref": _normalize_line(line),
+        "recorded_at_time_from": since.isoformat(),
+        "limit": 200,
+    }
+
+    # חשוב: ה-API הזה לפעמים מחזיר שדות בשמות שונים בין גרסאות/מקורות,
+    # אז אנחנו מנסים כמה אפשרויות (lat/lon או vehicle_location).
+    with httpx.Client(headers={"User-Agent": HEADERS["User-Agent"]}, timeout=10) as client:
+        r = client.get(f"{STRIDE_BASE}/siri_vehicle_locations/list", params=params)
+        r.raise_for_status()
+        data: list[dict[str, Any]] = r.json()
+
+    vehicles = []
+    for item in data or []:
+        lat = item.get("lat")
+        lon = item.get("lon")
+
+        nested = item.get("siri_vehicle_location") or item.get("vehicle_location") or {}
+        if lat is None:
+            lat = nested.get("lat")
+        if lon is None:
+            lon = nested.get("lon")
+
+        if lat is None or lon is None:
+            continue
+
+        vehicles.append(
+            {
+                "lat": float(lat),
+                "lon": float(lon),
+                "recorded_at_time": item.get("recorded_at_time") or nested.get("recorded_at_time"),
+                "vehicle_ref": item.get("siri_ride_vehicle_ref")
+                or item.get("vehicle_ref")
+                or item.get("vehicle_id")
+                or None,
+            }
+        )
+
+    return JSONResponse({"line": _normalize_line(line), "vehicles": vehicles})
